@@ -17,7 +17,7 @@ Welcome to the **Cerebras Test Scripts** repository! This project contains a col
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.8+ or Rust (if using Rust scripts)
 - Access to the Cerebras AI API (You can sign up [here](https://inference.cerebras.ai/))
 
 ### Installation
@@ -34,22 +34,49 @@ Navigate to the project directory:
 cd Cerebras-test-scripts
 ```
 
+### For Python Scripts
+
 Install the required dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
+### For Rust Scripts
+
+If you are working with Rust files, ensure that you have Rust installed. You can install it via [rustup](https://www.rust-lang.org/tools/install):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Once Rust is installed, navigate to the directory containing the Rust file:
+
+```bash
+cd rust_project_directory
+```
+
+To build the Rust project, run:
+
+```bash
+cargo build
+```
+
+To execute the Rust project, use:
+
+```bash
+cargo run
+```
+
 ### Usage
 
-To run a script, simply execute the following command in your terminal:
+For Python scripts, run a script with:
 
 ```bash
 python <script_name>.py
 ```
 
-Replace `<script_name>` with the name of the script you wish to execute.
-
+For Rust scripts, use `cargo run` as described above. Replace `<script_name>` or run the Rust project accordingly.
 
 ## Contributing
 
