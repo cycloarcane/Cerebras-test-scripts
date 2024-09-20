@@ -2,9 +2,8 @@ use gtk4::prelude::*;
 use gtk4::prelude::BoxExt;
 use gtk4::{Application, ApplicationWindow, Button, Entry, ScrolledWindow, TextView};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::env;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Message {
@@ -14,23 +13,28 @@ struct Message {
 
 #[derive(Serialize)]
 struct ChatCompletionRequest {
-    messages: Vec<Message>,
     model: String,
+    stream: bool,
+    messages: Vec<Message>,
+    temperature: f32,
+    max_tokens: i32,
+    seed: i32,
+    top_p: f32,
 }
 
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
-    choices: Vec<Choice>,
+    results: Vec<ResultEntry>,
 }
 
 #[derive(Deserialize)]
-struct Choice {
-    message: MessageContent,
+struct ResultEntry {
+    generations: Vec<Generation>,
 }
 
 #[derive(Deserialize)]
-struct MessageContent {
-    content: String,
+struct Generation {
+    text: String,
 }
 
 fn main() {
@@ -85,12 +89,41 @@ fn build_ui(app: &Application) {
     window.set_child(Some(&vbox));
 
     // Conversation history
-    let conversation_history = Rc::new(RefCell::new(Vec::new()));
+    let conversation_history = Arc::new(Mutex::new(Vec::new()));
+
+    // Create a channel to communicate between threads
+    let (sender, receiver) = glib::MainContext::channel::<String>(glib::PRIORITY_DEFAULT);
+
+    // Set up the receiver to update the GUI
+    {
+        let text_view_clone = text_view.clone();
+        let conversation_history_clone = Arc::clone(&conversation_history);
+
+        receiver.attach(None, move |assistant_response| {
+            // Update the conversation history
+            {
+                let mut history = conversation_history_clone.lock().unwrap();
+                history.push(Message {
+                    role: "assistant".to_string(),
+                    content: assistant_response.clone(),
+                });
+            }
+
+            // Update the TextView
+            let buffer = text_view_clone.buffer();
+            let current_text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            let new_text = format!("{}\nAssistant: {}", current_text, assistant_response);
+            buffer.set_text(&new_text);
+
+            glib::Continue(true)
+        });
+    }
 
     // Clone variables for closure
+    let conversation_history_clone = Arc::clone(&conversation_history);
     let text_view_clone = text_view.clone();
+    let sender_clone = sender.clone();
     let entry_clone = entry.clone();
-    let conversation_history_clone = conversation_history.clone();
 
     send_button.connect_clicked(move |_| {
         let user_input = entry_clone.text().to_string();
@@ -99,10 +132,13 @@ fn build_ui(app: &Application) {
         entry_clone.set_text("");
 
         // Append user's message to conversation history
-        conversation_history_clone.borrow_mut().push(Message {
-            role: "user".to_string(),
-            content: user_input.clone(),
-        });
+        {
+            let mut history = conversation_history_clone.lock().unwrap();
+            history.push(Message {
+                role: "user".to_string(),
+                content: user_input.clone(),
+            });
+        }
 
         // Update the text view
         let buffer = text_view_clone.buffer();
@@ -111,8 +147,8 @@ fn build_ui(app: &Application) {
         buffer.set_text(&new_text);
 
         // Clone for asynchronous block
-        let conversation_history_async = conversation_history_clone.clone();
-        let text_view_async = text_view_clone.clone();
+        let conversation_history_async = Arc::clone(&conversation_history_clone);
+        let sender_async = sender_clone.clone();
 
         // Perform HTTP request in a new thread
         std::thread::spawn(move || {
@@ -120,9 +156,19 @@ fn build_ui(app: &Application) {
             let api_key = env::var("CEREBRAS_API_KEY").unwrap_or_else(|_| "".to_string());
 
             // Prepare the request body
+            let messages = {
+                let history = conversation_history_async.lock().unwrap();
+                history.clone()
+            };
+
             let request_body = ChatCompletionRequest {
-                messages: conversation_history_async.borrow().clone(),
                 model: "llama3.1-8b".to_string(),
+                stream: false,
+                messages,
+                temperature: 0.0,
+                max_tokens: -1,
+                seed: 0,
+                top_p: 1.0,
             };
 
             // Create a blocking HTTP client
@@ -130,34 +176,46 @@ fn build_ui(app: &Application) {
 
             // Send the POST request
             let response = client
-                .post("https://api.cerebras.net/chat/completions")
-                .bearer_auth(api_key)
+                .post("https://api.cerebras.ai/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", api_key))
                 .json(&request_body)
                 .send();
 
             match response {
                 Ok(resp) => {
-                    if let Ok(resp_json) = resp.json::<ChatCompletionResponse>() {
-                        // Extract assistant's response
-                        let assistant_response = resp_json.choices[0].message.content.clone();
-
-                        // Append assistant's message to conversation history
-                        conversation_history_async.borrow_mut().push(Message {
-                            role: "assistant".to_string(),
-                            content: assistant_response.clone(),
-                        });
-
-                        // Update the TextView in the main thread
-                        gtk4::glib::MainContext::default().invoke(move || {
-                            let buffer = text_view_async.buffer();
-                            let current_text =
-                                buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-                            let new_text = format!(
-                                "{}\nAssistant: {}",
-                                current_text, assistant_response
-                            );
-                            buffer.set_text(&new_text);
-                        });
+                    // Read the response text
+                    let resp_text = match resp.text() {
+                        Ok(text) => text,
+                        Err(err) => {
+                            eprintln!("Failed to read response text: {:?}", err);
+                            return;
+                        }
+                    };
+            
+                    // Attempt to parse the JSON
+                    match serde_json::from_str::<ChatCompletionResponse>(&resp_text) {
+                        Ok(resp_json) => {
+                            // Extract assistant's response
+                            if let Some(result) = resp_json.results.first() {
+                                if let Some(generation) = result.generations.first() {
+                                    let assistant_response = generation.text.clone();
+            
+                                    // Send the assistant's response back to the main thread
+                                    sender_async.send(assistant_response).unwrap();
+                                } else {
+                                    eprintln!("No generations found in response");
+                                    eprintln!("Response Text: {:?}", resp_text);
+                                }
+                            } else {
+                                eprintln!("No results found in response");
+                                eprintln!("Response Text: {:?}", resp_text);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to parse response JSON: {:?}", err);
+                            eprintln!("Response Text: {:?}", resp_text);
+                        }
                     }
                 }
                 Err(err) => {
